@@ -1,0 +1,16 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: "Policy"
+metadata:
+  name: "__APP_NAME__"
+spec:
+  targets:
+    - name: __APP_NAME__
+  peers:
+    - mtls: {}
+  origins:
+    - jwt:
+        issuer: "utku.com"
+        jwksUri: "__JWKS_URI__"
+        audiences:
+          - "utku-client"
+        principalBinding: USE_ORIGIN

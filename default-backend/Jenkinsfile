@@ -1,0 +1,302 @@
+#!groovy
+import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
+
+DEPLOY_DIR_ALIAS = "deploy/"
+DEPLOY_CONF_DIR = "default-backend"
+
+MASTER_BRANCH = "master"
+DEVELOP_BRANCH = "develop"
+TEST_BRANCH = "test"
+RELEASE_BRANCH = "release"
+HOTFIX_BRANCH_PREFIX = "hotfix/"
+
+K8S_NAMESPACE = "wefocus"
+
+AUTHORIZATION_POLICY_FILE = "authorization-policy.yml"
+KUBE_DEPLOY_FILE_PATH = DEPLOY_DIR_ALIAS + "default-backend/deployment.yml"
+
+CLUSTER_CONFIG_DEV = "/kube.config/kube_10_206_41_119.config"
+CLUSTER_CONFIG_TEST = "/kube.config/kube_100_126_251_154.config"
+CLUSTER_CONFIG_PROD = "/kube.config/prod-kubernetes.kubeconfig"
+
+PROFILE_DEV = "dev"
+PROFILE_TEST = "test"
+PROFILE_PROD = "prod"
+
+JWKS_URI = "http:\\/\\/oauth2-authorization-service.authorization.svc.cluster.local\\/sso-auth-server\\/.well-known\\/jwks.json"
+
+K8S_RESOURCES = ["DestinationRule", "Policy", "Service", "ServiceAccount", "VirtualService"]
+
+//overwrite stage definition to have generic implementation for skipped stages
+def stage(name, execute, stageDefinition) {
+  return stage(name, execute ? stageDefinition : {
+    echo "skipped stage $name"
+    Utils.markStageSkippedForConditional(STAGE_NAME)
+  })
+}
+
+def getKubernetesClusterConfig(branch_name) {
+  if (branch_name == DEVELOP_BRANCH) {
+    return CLUSTER_CONFIG_DEV
+  } else if (branch_name == TEST_BRANCH) {
+    return CLUSTER_CONFIG_TEST
+  } else if (branch_name == MASTER_BRANCH) {
+    return CLUSTER_CONFIG_PROD
+  } else if (branch_name.startsWith(HOTFIX_BRANCH_PREFIX)) {
+    return CLUSTER_CONFIG_TEST
+  } else {
+    throw new Exception("Unhandled branch name to get kubernetes cluster config: ${branch_name}")
+  }
+}
+
+def getEnvProfile(branch_name){
+  if (branch_name == DEVELOP_BRANCH) {
+    println("Profile for " + DEVELOP_BRANCH + ": " + PROFILE_DEV)
+    return PROFILE_DEV
+  } else if (branch_name == TEST_BRANCH) {
+    println("Profile for " + TEST_BRANCH + ": " + PROFILE_TEST)
+    return PROFILE_TEST
+  }else if (branch_name == RELEASE_BRANCH) {
+    println("Profile for " + RELEASE_BRANCH + ": " + PROFILE_PROD)
+    return PROFILE_PROD
+  } else if (branch_name == MASTER_BRANCH) {
+    println("Profile for " + MASTER_BRANCH + ": " + PROFILE_PROD)
+    return PROFILE_PROD
+  } else if (branch_name.startsWith(HOTFIX_BRANCH_PREFIX)) {
+    println("Profile for " + HOTFIX_BRANCH_PREFIX + "*: " + PROFILE_PROD)
+    return PROFILE_PROD
+  } else {
+    throw new Exception("Unhandled branch name to get EnvProfile: ${branch_name}")
+  }
+}
+
+node {
+  NEXUS_URL = "100.126.248.97:8083"
+  NEXUS_CREDENTIAL_ID = "docker-operator-credential"
+
+  SONARQUBE_URL = "http://100.126.248.97"
+  SONARQUBE_PORT = "9000"
+  BUILD_VERSION = ""
+  APP_NAME = ""
+
+  stage('Print Variables', true, ({
+    println("\nRunning with subtree " + DEPLOY_CONF_DIR + " config.\n\ngitlabBranch: " + env.gitlabBranch +
+            "\ngitlabSourceBranch: " + env.gitlabSourceBranch +
+            "\ngitlabActionType: " + env.gitlabActionType +
+            "\ngitlabUserName: " + env.gitlabUserName +
+            "\ngitlabUserEmail: " + env.gitlabUserEmail +
+            "\ngitlabMergeRequestTitle: " + env.gitlabMergeRequestTitle +
+            "\ngitlabMergeRequestDescription: " + env.gitlabMergeRequestDescription +
+            "\ngitlabMergeRequestId: " + env.gitlabMergeRequestId +
+            "\ngitlabMergeRequestIid: " + env.gitlabMergeRequestIid +
+            "\ngitlabMergeRequestState: " + env.gitlabMergeRequestState +
+            "\ngitlabMergedByUser: " + env.gitlabMergedByUser +
+            "\ngitlabMergeRequestAssignee: " + env.gitlabMergeRequestAssignee +
+            "\ngitlabMergeRequestLastCommit: " + env.gitlabMergeRequestLastCommit +
+            "\ngitlabMergeRequestTargetProjectId: " + env.gitlabMergeRequestTargetProjectId +
+            "\ngitlabTargetBranch: " + env.gitlabTargetBranch +
+            "\ngitlabTargetRepoName: " + env.gitlabTargetRepoName)
+  } as Object))
+
+  stage("Clean Workspace", true, ({
+    cleanWs()
+  } as Object))
+
+  stage('Git Checkout', true, ({
+    checkout scm
+    sh 'git branch -av'
+  } as Object))
+
+  docker.image('maven:3.6.0-jdk-8-alpine').inside('-v /root/.m2:/root/.m2:z -e MAVEN_CONFIG=/root/.m2 ' +
+          '-e MAVEN_OPTS="-Duser.home=/root/"') {
+
+    stage('Build', (gitlabActionType == 'PUSH' && gitlabSourceBranch != MASTER_BRANCH)
+            || gitlabActionType == 'MERGE' || gitlabActionType == 'NOTE', ({
+      BUILD_VERSION = sh returnStdout: true, script: 'cat VERSION'
+      BUILD_VERSION = BUILD_VERSION.replaceAll("\n", "").replaceAll("\r", "")
+      APP_NAME = sh returnStdout: true, script: 'mvn help:evaluate -Dexpression=project.name -q -DforceStdout'
+
+      sh 'mvn verify -DskipTests -Drevision=' + BUILD_VERSION
+
+      stash name: 'docker-image-source', includes: 'Dockerfile,target/*.jar'
+    } as Object))
+
+    stage('Unit Tests', (gitlabActionType == 'PUSH' && gitlabSourceBranch != MASTER_BRANCH)
+            || gitlabActionType == 'MERGE' || gitlabActionType == 'NOTE', ({
+      try {
+        sh 'mvn test'
+      } finally {
+        try {
+          junit 'target/surefire-reports/**/*.xml'
+        } catch (exc) {
+          println("Jacoco reports were not generated." + exc)
+        }
+      }
+    } as Object))
+
+    stage('Code Quality Analysis', ((gitlabActionType == 'MERGE' || gitlabActionType == 'NOTE')
+            && gitlabTargetBranch.startsWith(DEVELOP_BRANCH) && !gitlabSourceBranch.startsWith(RELEASE_BRANCH)), ({
+      try {
+        parallel 'JavaDoc': {
+          stage('JavaDoc', true, ({
+            sh "mvn javadoc:javadoc"
+            stash name: 'JavaDOC', allowEmpty: true, includes: './target/site/apidocs'
+            step([$class: 'JavadocArchiver', javadocDir: './target/site/apidocs', keepAll: 'true'])
+          } as Object))
+        }, 'PMD': {
+          stage('PMD', true, ({
+            sh "mvn pmd:pmd"
+            // using pmd plugin
+            stash name: 'PMD', allowEmpty: true, includes: '**/target/pmd.xml'
+            step([$class: 'PmdPublisher', pattern: '**/target/pmd.xml'])
+          } as Object))
+        }, 'Findbugs': {
+          stage('Findbugs', true, ({
+            sh "mvn findbugs:findbugs"
+            // using findbugs plugin
+            stash name: 'Findbugs', allowEmpty: true, includes: '**/target/findbugsXml.xml'
+            findbugs pattern: '**/target/findbugsXml.xml'
+          } as Object))
+        }, 'SonarQube': {
+          stage('SonarQube', true, ({
+            sh "mvn -Drevision=" + BUILD_VERSION + " sonar:sonar -Dsonar.host.url=$SONARQUBE_URL:$SONARQUBE_PORT"
+          } as Object))
+        }
+      } finally {
+        unstash 'JavaDOC'
+        unstash 'PMD'
+        unstash 'Findbugs'
+        recordIssues aggregatingResults: true, tools: [javaDoc(), checkStyle(pattern: '**/target/checkstyle-result.xml'),
+                                                       findBugs(pattern: '**/target/findbugsXml.xml', useRankAsPriority: true),
+                                                       pmdParser(pattern: '**/target/pmd.xml')]
+      }
+    } as Object))
+  }
+
+  stage('Build Docker Image', (gitlabActionType == 'PUSH' && (gitlabSourceBranch == DEVELOP_BRANCH ||
+          gitlabSourceBranch == TEST_BRANCH  || gitlabSourceBranch == RELEASE_BRANCH || gitlabSourceBranch.startsWith(HOTFIX_BRANCH_PREFIX))), ({
+
+    unstash 'docker-image-source'
+
+    if (!(gitlabSourceBranch == RELEASE_BRANCH || gitlabSourceBranch.startsWith(HOTFIX_BRANCH_PREFIX))) {
+      BUILD_VERSION = BUILD_VERSION + "-" + BUILD_NUMBER
+    }
+
+    envProfile = getEnvProfile(gitlabSourceBranch)
+
+    dockerfileName = "Dockerfile-tmp"
+
+    sh "sed -e 's/__APPLICATION_PROFILE__/${envProfile}/g' Dockerfile > ${dockerfileName}"
+
+    app = docker.build("$APP_NAME:$BUILD_VERSION", " -f ./${dockerfileName} .")
+
+  } as Object))
+
+  stage('Push Docker Image', (gitlabActionType == 'PUSH' && (gitlabSourceBranch == DEVELOP_BRANCH ||
+          gitlabSourceBranch == TEST_BRANCH  || gitlabSourceBranch == RELEASE_BRANCH || gitlabSourceBranch.startsWith(HOTFIX_BRANCH_PREFIX))), ({
+    docker.withRegistry('http://' + NEXUS_URL, NEXUS_CREDENTIAL_ID) {
+      app.push()
+    }
+  } as Object))
+
+  stage('Deploy to K8S', (gitlabActionType == 'PUSH' && (gitlabSourceBranch == MASTER_BRANCH ||
+          gitlabSourceBranch == TEST_BRANCH ||
+          gitlabSourceBranch == DEVELOP_BRANCH)), ({
+
+    /* Push image using withRegistry. */
+    IMAGE_NAME = NEXUS_URL + "\\/" + APP_NAME + ':' + BUILD_VERSION
+
+    k8sClusterConfig = getKubernetesClusterConfig(gitlabSourceBranch)
+    updatedAuthPolicyFileName = APP_NAME + '-AuthorizationPolicy.yml'
+
+    Set<String> changedResources = checkAndUpdateResourcesIfNeeded(k8sClusterConfig, APP_NAME)
+
+    for(String  item in changedResources){
+      println("resource to apply: " + item)
+      String resourceType = item.substring(item.lastIndexOf("/") + 1, item.lastIndexOf("."));
+      deleteResource(k8sClusterConfig, resourceType, item, APP_NAME)
+      applyChanges(k8sClusterConfig,  resourceType, item, APP_NAME)
+    }
+
+    sh "sed -e 's/__APP_NAME__/${APP_NAME}/g' -e 's/__IMAGE_NAME__/${IMAGE_NAME}/g' " +
+            "-e 's/__K8S_NAMESPACE__/${K8S_NAMESPACE}/g' -e 's/__JWKS_URI__/${JWKS_URI}/g' ${KUBE_DEPLOY_FILE_PATH} > ${APP_NAME}-deploy.yml"
+
+    sh "sed 's/__APP_NAME__/${APP_NAME}/g' ${AUTHORIZATION_POLICY_FILE} > ${updatedAuthPolicyFileName}"
+
+    sh 'kubectl --kubeconfig ' + k8sClusterConfig + ' apply -f ' + APP_NAME + '-deploy.yml -n ' + K8S_NAMESPACE
+    println("deployment applied")
+
+    sh 'kubectl --kubeconfig ' + k8sClusterConfig + ' apply -f ' + updatedAuthPolicyFileName + ' -n ' + K8S_NAMESPACE
+    println("authorization policy applied")
+
+  } as Object))
+}
+
+def checkAndUpdateResourcesIfNeeded(k8sClusterConfig, appName) {
+  String otherConfDir = DEPLOY_CONF_DIR + "/other"
+
+  Set<String> changedResources = []
+  Set<String> appliedResources = applyNonExistResources(otherConfDir, k8sClusterConfig, appName)
+
+  for (changeLogSet in currentBuild.changeSets) {
+    for (entry in changeLogSet.getItems()) { // for each commit in the detected changes
+      for (file in entry.getAffectedFiles()) {
+        String filePath = file.getPath()
+        if (filePath.contains(otherConfDir) && filePath.endsWith(".yml")) {
+          println("changed file in resources path: " + filePath)
+          String resourceType = filePath.substring(filePath.lastIndexOf("/") + 1, filePath.lastIndexOf("."));
+          if (appliedResources.contains(resourceType)) {
+            println("resource already applied: " + resourceType)
+          } else {
+            if(!filePath.startsWith(DEPLOY_DIR_ALIAS)) {
+              filePath = DEPLOY_DIR_ALIAS + filePath
+            }
+            println("resource change detected in this build " + resourceType + " - " + filePath)
+            changedResources.add(filePath)
+          }
+        }
+      }
+    }
+  }
+
+  println("finish checking changed files")
+
+  return changedResources
+}
+
+def applyNonExistResources(String rootPath, String k8sClusterConfig, String appName) {
+  Set<String> appliedResources = []
+
+  K8S_RESOURCES.each {
+    if (!isResourceExist(k8sClusterConfig, it, K8S_NAMESPACE)) {
+      String resourceFile = DEPLOY_DIR_ALIAS + rootPath + "/" + it + ".yml"
+      println(it + " not exist.  path: " + resourceFile)
+      applyChanges(k8sClusterConfig, it, resourceFile, appName)
+      appliedResources.add(it)
+    } else {
+      println(it + " exists in namespace")
+    }
+  }
+  return appliedResources
+}
+
+def isResourceExist(k8sClusterConfig, resourceKind, namespace) {
+  return sh(
+          script: 'kubectl --kubeconfig ' + k8sClusterConfig + ' get ' + resourceKind + ' ' + APP_NAME + ' -n ' + K8S_NAMESPACE,
+          returnStatus: true) == 0;
+}
+
+def deleteResource(String k8sClusterConfig, Object resourceKind, String path, String appName) {
+  println("delete resource before apply changes " + resourceKind + " - " + path + " - " + appName)
+  sh 'kubectl --kubeconfig ' + k8sClusterConfig + ' delete ' + resourceKind + ' ' + appName + ' -n ' + K8S_NAMESPACE
+  println("Resource deleted: " + resourceKind)
+}
+
+def applyChanges(String k8sClusterConfig, Object resourceKind, String path, String appName) {
+  def tmpResourceFileName = appName + "-" + resourceKind + ".yml"
+  sh "sed -e 's/__APP_NAME__/${appName}/g' -e 's/__K8S_NAMESPACE__/${K8S_NAMESPACE}/g' " +
+          "-e 's/__JWKS_URI__/${JWKS_URI}/g' ${path} > ${tmpResourceFileName}"
+
+  sh 'kubectl --kubeconfig ' + k8sClusterConfig + ' apply -f ' + tmpResourceFileName + ' -n ' + K8S_NAMESPACE
+  println("Resource applied: " + resourceKind)
+}

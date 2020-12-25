@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __APP_NAME__
+  labels:
+    app: __APP_NAME__
+    version: v1
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: __APP_NAME__
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: __APP_NAME__
+        version: v1
+      annotations:
+        sidecar.istio.io/rewriteAppHTTPProbers: "true"
+        # we can also define custom resource limits for istio here
+        # but it is said that there is already default values for sidecars
+        # see this link: https://github.com/istio/istio/issues/16126#issuecomment-537909578
+    spec:
+      serviceAccountName: __APP_NAME__
+      containers:
+        - name: __APP_NAME__
+          image: __IMAGE_NAME__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1024Mi"
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /actuator/health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            successThreshold: 1
+            timeoutSeconds: 1
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /actuator/health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 1
+      imagePullSecrets:
+        - name: docker-nexus

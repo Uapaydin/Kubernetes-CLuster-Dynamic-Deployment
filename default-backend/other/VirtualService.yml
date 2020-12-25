@@ -1,0 +1,33 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: __APP_NAME__
+spec:
+  hosts:
+    - "*"
+  gateways:
+    - microservice-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /__APP_NAME__
+      rewrite:
+        uri: ' '
+      route:
+        - destination:
+            port:
+              number: 80
+            host: __APP_NAME__.__K8S_NAMESPACE__.svc.cluster.local
+      corsPolicy:
+        allowOrigin:
+          - '*'
+        allowMethods:
+          - POST
+          - GET
+          - OPTIONS
+          - PUT
+          - DELETE
+        allowHeaders:
+          - '*'
+        maxAge: 86400s
+        allowCredentials: true
